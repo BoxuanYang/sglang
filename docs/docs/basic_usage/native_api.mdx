@@ -359,11 +359,13 @@ terminate_process(reward_process)
 
 SGLang Runtime supports recording the number of times an expert is selected in a MoE model run for each expert in the model. This is useful when analyzing the throughput of the model and plan for optimization.
 
+The `aggregate` mode stores only one cumulative `logical_count` tensor with shape `[num_layers, num_experts]`, so its memory usage does not grow with the number of recorded tokens. `--expert-distribution-recorder-buffer-size` is ignored in this mode.
+
 *Note: We only print out the first 10 lines of the csv below for better readability. Please adjust accordingly if you want to analyze the results more deeply.*
 
 ```python Example
 expert_record_server_process, port = launch_server_cmd(
-    "python3 -m sglang.launch_server --model-path Qwen/Qwen1.5-MoE-A2.7B --host 0.0.0.0 --expert-distribution-recorder-mode stat --log-level warning"
+    "python3 -m sglang.launch_server --model-path Qwen/Qwen1.5-MoE-A2.7B --host 0.0.0.0 --expert-distribution-recorder-mode aggregate --log-level warning"
 )
 
 wait_for_server(f"http://localhost:{port}", process=expert_record_server_process)

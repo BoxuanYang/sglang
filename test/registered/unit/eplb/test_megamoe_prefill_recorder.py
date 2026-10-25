@@ -7,6 +7,8 @@ import torch
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.eplb_map_record_fused import eplb_map_and_record_fused
 from sglang.srt.eplb.expert_distribution import (
+    _Accumulator,
+    _AggregateAccumulator,
     _ExpertDistributionRecorderReal,
     _InfiniteBuffer,
     _SelectExpertsSinglePassGatherer,
@@ -14,9 +16,10 @@ from sglang.srt.eplb.expert_distribution import (
     should_record_forward_pass,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -29,7 +32,7 @@ def _batch(mode: ForwardMode, *, extend_tokens: int = 0, any_prefill: bool = Fal
     )
 
 
-class TestMegaMoEPrefillRecorder(unittest.TestCase):
+class TestMegaMoEPrefillRecorder(CustomTestCase):
     def setUp(self):
         self.env_patches = (
             patch(
@@ -180,7 +183,68 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         return recorder
 
 
-class TestInfiniteBuffer(unittest.TestCase):
+class TestAggregateAccumulator(CustomTestCase):
+    def test_constant_size_and_exact_logical_totals(self):
+        metadata = SimpleNamespace(
+            num_layers=2,
+            num_logical_experts=3,
+            physical_to_logical_map=torch.tensor(
+                [[0, 1, 2, 1], [2, 1, 0, 2]], dtype=torch.int64
+            ),
+        )
+        with (
+            patch(
+                "sglang.srt.eplb.expert_distribution.reports_expert_balancedness",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.eplb.expert_distribution.get_device_namespace",
+                return_value=SimpleNamespace(device="cpu"),
+            ),
+        ):
+            accumulator = _AggregateAccumulator(metadata, rank=0)
+
+        storage_id = id(accumulator._logical_count)
+        first = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+        second = torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]])
+        for forward_pass_id, counts in enumerate((first, second)):
+            accumulator.append(
+                forward_pass_id,
+                "primary",
+                {"global_physical_count": counts},
+                {},
+            )
+
+        self.assertEqual(id(accumulator._logical_count), storage_id)
+        self.assertEqual(accumulator._logical_count.shape, (2, 3))
+        self.assertEqual(accumulator._logical_count.dtype, torch.int64)
+        self.assertTrue(
+            torch.equal(
+                accumulator._logical_count,
+                torch.tensor([[11, 66, 33], [77, 66, 143]]),
+            )
+        )
+
+        with patch("torch.distributed.all_reduce"):
+            output = accumulator.dump(output_mode="object")
+        self.assertEqual(output["logical_count"].shape, (2, 3))
+        self.assertTrue(
+            torch.equal(output["logical_count"], accumulator._logical_count)
+        )
+
+        accumulator.reset()
+        self.assertEqual(accumulator._logical_count.count_nonzero().item(), 0)
+        self.assertEqual(id(accumulator._logical_count), storage_id)
+
+    def test_mode_selects_aggregate_accumulator(self):
+        with get_context().override_server_args(
+            model_path="dummy",
+            expert_distribution_recorder_mode="aggregate",
+        ):
+            self.assertIs(_Accumulator.get_class(), _AggregateAccumulator)
+
+
+class TestInfiniteBuffer(CustomTestCase):
     def test_growth_inside_inference_mode_accepts_later_appends(self):
         """A buffer grown under inference_mode must still accept appends outside it."""
         buffer = _InfiniteBuffer(item_shape=(2,), dtype=torch.int32, device="cpu")

@@ -737,6 +737,7 @@ class _Accumulator(ABC):
     @staticmethod
     def get_class() -> Type[_Accumulator]:
         return {
+            "aggregate": _AggregateAccumulator,
             "stat": _StatAccumulator,
             "stat_approx": _StatAccumulator,
             "per_pass": _DetailAccumulator,
@@ -876,6 +877,31 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                         count_of_layer._buckets[gpu_rank].inc(count)
         self._metric_heatmap_collection_counter += 1
 
+    def _get_global_average_utilization_rate(self):
+        if not self._enable or math.isclose(
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
+        ):
+            return None
+
+        if self._rank == 0:
+            utilization_mean_rates = self._history.mean()
+            window_index = self.window_sizes[-1]
+            average_utilization_rate_over_window = (
+                utilization_mean_rates[window_index]
+                if window_index in utilization_mean_rates
+                else 0
+            )
+
+            avg_rate_tensor = torch.tensor(
+                [average_utilization_rate_over_window],
+                dtype=torch.float32,
+                device="cuda",
+            )
+        else:
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        return avg_rate_tensor.item()
+
 
 class _DequeCollection:
     def __init__(self, maxlens: Sequence[int]):
@@ -1009,30 +1035,64 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         else:
             raise NotImplementedError
 
-    def _get_global_average_utilization_rate(self):
-        if not self._enable or math.isclose(
-            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
-        ):
-            return None
 
-        if self._rank == 0:
-            utilization_mean_rates = self._history.mean()
-            window_index = self.window_sizes[-1]
-            average_utilization_rate_over_window = (
-                utilization_mean_rates[window_index]
-                if window_index in utilization_mean_rates
-                else 0
-            )
+class _AggregateAccumulator(_UtilizationRateAccumulatorMixin):
+    """Keep only cumulative logical-expert counts.
 
-            avg_rate_tensor = torch.tensor(
-                [average_utilization_rate_over_window],
-                dtype=torch.float32,
-                device="cuda",
-            )
+    Unlike ``_StatAccumulator``, memory usage is constant and independent of
+    the number of recorded forward passes. The leading step dimension is not
+    retained because this mode is intended for whole-run activation totals,
+    not step-aware EPLB analysis.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._logical_count = torch.zeros(
+            (
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_logical_experts,
+            ),
+            dtype=torch.int64,
+            device=get_device_namespace().device,
+        )
+
+    def append(
+        self,
+        forward_pass_id: int,
+        gatherer_key: str,
+        single_pass_data: Dict,
+        outputs: Dict[str, Any],
+    ):
+        super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
+        self._logical_count.scatter_add_(
+            dim=1,
+            index=self._expert_location_metadata.physical_to_logical_map.to(
+                torch.int64
+            ),
+            src=single_pass_data["global_physical_count"].to(torch.int64),
+        )
+
+    def reset(self):
+        super().reset()
+        self._logical_count.zero_()
+
+    def dump(self, output_mode: _OutputMode):
+        logical_count = self._logical_count.clone()
+        torch.distributed.all_reduce(logical_count, op=torch.distributed.ReduceOp.SUM)
+
+        output = dict(
+            rank=self._rank,
+            logical_count=logical_count,
+            average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
+        )
+
+        if output_mode == "file":
+            if self._rank == 0:
+                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+        elif output_mode == "object":
+            return output
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
-        return avg_rate_tensor.item()
+            raise NotImplementedError
 
 
 def _dump_to_file(name, data):

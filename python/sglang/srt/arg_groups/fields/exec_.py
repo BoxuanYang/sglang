@@ -899,12 +899,18 @@ class ExecMoe(msgspec.Struct):
         "Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",
     ] = 1.0
     expert_distribution_recorder_mode: A[
-        Optional[Literal["stat", "stat_approx", "per_pass", "per_token"]],
-        "Mode of expert distribution recorder.",
+        Optional[
+            Literal["aggregate", "stat", "stat_approx", "per_pass", "per_token"]
+        ],
+        (
+            "Mode of expert distribution recorder. 'aggregate' keeps only total "
+            "counts per layer and expert with constant memory; the other modes "
+            "retain per-step or per-token detail."
+        ),
     ] = None
     expert_distribution_recorder_buffer_size: A[
         Optional[int],
-        "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer. Ignored in aggregate mode.",
     ] = None
     expert_balancedness_report_mode: A[
         Literal["off", "server_log", "prometheus", "both"],
