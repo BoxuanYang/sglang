@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -274,6 +275,15 @@ def load_eligible_requests(
     return eligible
 
 
+def derive_sampling_seed(base_seed: int, request_rate: float) -> int:
+    """Derive a stable, independent sampling seed for one request rate."""
+    key = f"{base_seed}:{float(request_rate).hex()}".encode("ascii")
+    return int.from_bytes(
+        hashlib.blake2b(key, digest_size=8, person=b"sglang-rps").digest(),
+        byteorder="big",
+    )
+
+
 def sample_requests(
     eligible: Sequence[RequestSpec], num_requests: int, seed: int
 ) -> list[RequestSpec]:
@@ -447,6 +457,7 @@ def summarize_group(
     request_rate: float,
     num_prompts: int,
     group_run: RateGroupRun,
+    sampling_seed: int,
 ) -> dict[str, Any]:
     successful = [
         item
@@ -467,6 +478,7 @@ def summarize_group(
     return {
         "request_rate": request_rate,
         "num_prompts": num_prompts,
+        "sampling_seed": sampling_seed,
         "benchmark_duration_seconds": duration,
         "submission_duration_seconds": group_run.submission_duration_seconds,
         "mean_normalized_latency_seconds_per_token": (
@@ -509,6 +521,10 @@ def build_metadata(
         "num_prompts": list(num_prompts),
         "duration_per_rate_seconds": args.duration_per_rate,
         "seed": args.seed,
+        "sampling_seed_definition": (
+            "blake2b-64 of '<base seed>:<request rate as float.hex()>'; "
+            "each RPS has an independent deterministic request sample and order"
+        ),
         "max_prompt_tokens": args.max_prompt_tokens,
         "max_total_tokens": args.max_total_tokens,
         "output_token_tolerance": args.output_token_tolerance,
@@ -579,7 +595,8 @@ async def run(args: argparse.Namespace) -> None:
             f"num_prompts={request_count}",
             flush=True,
         )
-        sampled = sample_requests(eligible, request_count, args.seed)
+        sampling_seed = derive_sampling_seed(args.seed, request_rate)
+        sampled = sample_requests(eligible, request_count, sampling_seed)
         group_run = await run_rate_group(
             requests=sampled,
             request_rate=request_rate,
@@ -593,12 +610,13 @@ async def run(args: argparse.Namespace) -> None:
             output_token_tolerance=args.output_token_tolerance,
         )
 
-        summary = summarize_group(request_rate, request_count, group_run)
+        summary = summarize_group(request_rate, request_count, group_run, sampling_seed)
         summary_document["results"].append(summary)
         request_document["groups"].append(
             {
                 "request_rate": request_rate,
                 "num_prompts": request_count,
+                "sampling_seed": sampling_seed,
                 "requests": [asdict(item) for item in group_run.measurements],
             }
         )
