@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RATES = tuple(range(1, 21))
-DEFAULT_DURATION_PER_RATE_SECONDS = 300.0
+DEFAULT_DURATION_PER_RATE_SECONDS = 200.0
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 
